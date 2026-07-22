@@ -37,7 +37,17 @@ try {
 }
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5500',
+    'http://localhost:5000',
+    'http://127.0.0.1:5500',
+    'https://scrabl.com',
+    'https://www.scrabl.com',
+    'https://ahceed.github.io'
+  ],
+  credentials: true
+}));
 app.use(express.json());
 
 // ========== IN-MEMORY STORAGE (auth - kept for now) ==========
@@ -84,7 +94,9 @@ const SMTP_PASSWORD = process.env.SMTP_PASSWORD;
 
 if (SMTP_EMAIL && SMTP_PASSWORD) {
     emailTransport = nodemailer.createTransport({
-        service: 'gmail',
+        host: 'smtp.gmail.com',
+        port: 587,
+        secure: false,
         auth: { user: SMTP_EMAIL, pass: SMTP_PASSWORD }
     });
 } else {
