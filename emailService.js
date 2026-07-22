@@ -1,14 +1,10 @@
 require('dotenv').config();
 
-let emailTransport = null;
-
-function setEmailTransport(transport) {
-    emailTransport = transport;
-}
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const FROM_EMAIL = process.env.FROM_EMAIL || 'Scrabl <onboarding@resend.dev>';
 
 async function sendWaitlistEmail(email, waitlistCode, name = 'Creator') {
     const displayName = name || 'Creator';
-    const SMTP_EMAIL = process.env.SMTP_EMAIL || 'no-reply@scrabl.ai';
 
     const htmlBody = `
 <div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 520px; margin: 0 auto; background: #0a0a0a; color: #f5f5f5; border-radius: 16px; overflow: hidden; border: 1px solid #1a1a1a;">
@@ -36,50 +32,67 @@ async function sendWaitlistEmail(email, waitlistCode, name = 'Creator') {
     </div>
 </div>`;
 
-    const message = {
-        from: `"scrabl." <${SMTP_EMAIL}>`,
-        to: email,
-        subject: "Your Scrabl Verification Code",
-        text: `Hello ${displayName},\n\nYour Scrabl verification code: ${waitlistCode}\n\nEnter this code on the waitlist page to confirm your spot.\n\n#scrabl26 — The Scrabl Team`,
-        html: htmlBody
-    };
-
-    if (emailTransport) {
-        console.log(`📨 Sending waitlist email to ${email}`);
-        const info = await emailTransport.sendMail(message);
-        console.log(`✅ Email sent to ${email}: ${info.messageId || 'sent'}`);
-        return info;
-    } else {
-        // Dev fallback: log to console
-        console.log(`📨 [DEV] Waitlist email for ${email}`);
-        console.log(`🔐 Code: ${waitlistCode}`);
+    if (!RESEND_API_KEY) {
+        console.log(`[DEV] Waitlist email for ${email}`);
+        console.log(`Code: ${waitlistCode}`);
         return null;
     }
+
+    console.log(`Sending waitlist email to ${email}`);
+
+    const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${RESEND_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            from: FROM_EMAIL,
+            to: [email],
+            subject: 'Your Scrabl Verification Code',
+            html: htmlBody,
+            text: `Hello ${displayName},\n\nYour Scrabl verification code: ${waitlistCode}\n\nEnter this code on the waitlist page to confirm your spot.\n\n#scrabl26 - The Scrabl Team`
+        })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        console.error(`Email failed for ${email}:`, data);
+        throw new Error(data.message || 'Email send failed');
+    }
+
+    console.log(`Email sent to ${email}: ${data.id}`);
+    return data;
 }
 
 async function sendAdminNotification(entry) {
-    if (!emailTransport) return null;
+    if (!RESEND_API_KEY) return null;
 
-    const SMTP_EMAIL = process.env.SMTP_EMAIL || 'no-reply@scrabl.ai';
-    const adminEmail = process.env.WAITLIST_NOTIFICATION_EMAIL || SMTP_EMAIL;
+    const adminEmail = process.env.WAITLIST_NOTIFICATION_EMAIL;
+    if (!adminEmail) return null;
 
-    const message = {
-        from: `"scrabl." <${SMTP_EMAIL}>`,
-        to: adminEmail,
-        subject: `New Scrabl waitlist signup: ${entry.email}`,
-        text: `New waitlist signup:\nEmail: ${entry.email}\nName: ${entry.name || 'N/A'}\nJoined: ${entry.createdAt}`,
-        html: `<p><strong>New waitlist signup:</strong></p>
-<ul>
-    <li><strong>Email:</strong> ${entry.email}</li>
-    <li><strong>Name:</strong> ${entry.name || 'N/A'}</li>
-    <li><strong>Joined:</strong> ${entry.createdAt}</li>
-</ul>`
-    };
+    const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${RESEND_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            from: FROM_EMAIL,
+            to: [adminEmail],
+            subject: `New Scrabl waitlist signup: ${entry.email}`,
+            html: `<p><strong>New waitlist signup:</strong></p><ul><li><strong>Email:</strong> ${entry.email}</li><li><strong>Name:</strong> ${entry.name || 'N/A'}</li><li><strong>Joined:</strong> ${entry.createdAt}</li></ul>`
+        })
+    });
 
-    console.log(`📨 Sending admin notification to ${adminEmail}`);
-    const info = await emailTransport.sendMail(message);
-    console.log(`✅ Admin notification sent: ${info.messageId || 'sent'}`);
-    return info;
+    const data = await response.json();
+    if (response.ok) {
+        console.log(`Admin notification sent: ${data.id}`);
+    }
+    return data;
 }
+
+function setEmailTransport() {}
 
 module.exports = { sendWaitlistEmail, sendAdminNotification, setEmailTransport };
