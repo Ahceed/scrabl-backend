@@ -567,7 +567,19 @@ app.get('/api/health', (req, res) => {
 });
 
 async function startServer() {
-    // Verify SMTP if configured
+    const server = app.listen(PORT, () => {
+        console.log(`\n🚀 Scrabl Backend running on http://localhost:${PORT}`);
+        console.log(`📝 OTP codes logged to console in dev mode\n`);
+    });
+
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.error(`\n⚠️  Port ${PORT} is already in use.`);
+            process.exit(1);
+        }
+        throw err;
+    });
+
     if (emailTransport) {
         setEmailTransport(emailTransport);
         try {
@@ -576,22 +588,9 @@ async function startServer() {
             console.log('✅ Gmail SMTP verified and ready');
         } catch (err) {
             console.warn('⚠️ SMTP verification failed:', err.message);
-            console.warn('   Waitlist codes will be logged to console instead');
+            console.warn('   Waitlist emails will still be attempted on send');
+            emailTransportReady = true;
         }
     }
-
-    const server = app.listen(PORT, () => {
-        console.log(`\n🚀 Scrabl Backend running on http://localhost:${PORT}`);
-        console.log(`📝 OTP codes logged to console in dev mode\n`);
-    });
-
-    server.on('error', (err) => {
-        if (err.code === 'EADDRINUSE') {
-            console.error(`\n⚠️  Port ${PORT} is already in use. Stop the other process or set a different PORT in .env.`);
-            process.exit(1);
-        }
-        throw err;
-    });
 }
-
 startServer();
