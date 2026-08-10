@@ -1,15 +1,64 @@
 require('dotenv').config();
 
-let emailTransport = null;
+/*
+ * Scrabl email service — sends via Resend's HTTP API (works on Render,
+ * which blocks outbound SMTP). Uses env vars:
+ *   RESEND_API_KEY              your Resend API key
+ *   FROM_EMAIL                  e.g.  Scrabl <noreply@scrabl.com>
+ *   WAITLIST_NOTIFICATION_EMAIL where admin notices go (your inbox)
+ */
 
-function setEmailTransport(transport) {
-    emailTransport = transport;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const ADMIN_EMAIL = process.env.WAITLIST_NOTIFICATION_EMAIL || process.env.SMTP_EMAIL;
+
+// Format the "from" field so Resend always accepts it
+function normalizeFrom(raw) {
+    if (!raw) return 'Scrabl <onboarding@resend.dev>';
+    if (raw.includes('<')) return raw;                       // already "Name <email>"
+    const m = raw.match(/^(.*?)\s*([^\s]+@[^\s]+)$/);
+    if (m && m[1]) return `${m[1].trim()} <${m[2]}>`;        // "Name email" -> "Name <email>"
+    if (m) return m[2];                                       // bare email
+    return raw;
+}
+const FROM_EMAIL = normalizeFrom(process.env.FROM_EMAIL);
+
+// Kept only so server.js's setEmailTransport(...) call doesn't break.
+// Resend sending does NOT use this.
+let emailTransport = null;
+function setEmailTransport(transport) { emailTransport = transport; }
+
+// Core sender — one place that talks to Resend
+async function sendViaResend({ to, subject, html, text }) {
+    if (!RESEND_API_KEY) {
+        console.warn(`⚠️  RESEND_API_KEY not set — email NOT sent: "${subject}"`);
+        return null;
+    }
+    try {
+        const res = await fetch('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${RESEND_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ from: FROM_EMAIL, to, subject, html, text })
+        });
+
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`Resend API ${res.status}: ${errText}`);
+        }
+        const data = await res.json();
+        console.log(`✅ Email sent via Resend (${data.id || 'ok'}) → ${to}`);
+        return data;
+    } catch (err) {
+        console.warn(`⚠️ Resend send failed for "${subject}":`, err.message);
+        throw err;
+    }
 }
 
+// ---------- 1. Waitlist verification code (to the new signup) ----------
 async function sendWaitlistEmail(email, waitlistCode, name = 'Creator') {
     const displayName = name || 'Creator';
-    const SMTP_EMAIL = process.env.SMTP_EMAIL || 'no-reply@scrabl.ai';
-
     const htmlBody = `
 <div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 520px; margin: 0 auto; background: #0a0a0a; color: #f5f5f5; border-radius: 16px; overflow: hidden; border: 1px solid #1a1a1a;">
     <div style="padding: 40px 30px 20px; text-align: center;">
@@ -36,36 +85,19 @@ async function sendWaitlistEmail(email, waitlistCode, name = 'Creator') {
     </div>
 </div>`;
 
-    const message = {
-        from: `"scrabl." <${SMTP_EMAIL}>`,
+    return sendViaResend({
         to: email,
-        subject: "Your Scrabl Verification Code",
+        subject: 'Your Scrabl Verification Code',
         text: `Hello ${displayName},\n\nYour Scrabl verification code: ${waitlistCode}\n\nEnter this code on the waitlist page to confirm your spot.\n\n#scrabl26 — The Scrabl Team`,
         html: htmlBody
-    };
-
-    if (emailTransport) {
-        console.log(`📨 Sending waitlist email to ${email}`);
-        const info = await emailTransport.sendMail(message);
-        console.log(`✅ Email sent to ${email}: ${info.messageId || 'sent'}`);
-        return info;
-    } else {
-        // Dev fallback: log to console
-        console.log(`📨 [DEV] Waitlist email for ${email}`);
-        console.log(`🔐 Code: ${waitlistCode}`);
-        return null;
-    }
+    });
 }
 
+// ---------- 2. Admin notice: new waitlist signup (to you) ----------
 async function sendAdminNotification(entry) {
-    if (!emailTransport) return null;
-
-    const SMTP_EMAIL = process.env.SMTP_EMAIL || 'no-reply@scrabl.ai';
-    const adminEmail = process.env.WAITLIST_NOTIFICATION_EMAIL || SMTP_EMAIL;
-
-    const message = {
-        from: `"scrabl." <${SMTP_EMAIL}>`,
-        to: adminEmail,
+    if (!ADMIN_EMAIL) return null;
+    return sendViaResend({
+        to: ADMIN_EMAIL,
         subject: `New Scrabl waitlist signup: ${entry.email}`,
         text: `New waitlist signup:\nEmail: ${entry.email}\nName: ${entry.name || 'N/A'}\nJoined: ${entry.createdAt}`,
         html: `<p><strong>New waitlist signup:</strong></p>
@@ -74,42 +106,29 @@ async function sendAdminNotification(entry) {
     <li><strong>Name:</strong> ${entry.name || 'N/A'}</li>
     <li><strong>Joined:</strong> ${entry.createdAt}</li>
 </ul>`
-    };
-
-    console.log(`📨 Sending admin notification to ${adminEmail}`);
-    const info = await emailTransport.sendMail(message);
-    console.log(`✅ Admin notification sent: ${info.messageId || 'sent'}`);
-    return info;
+    });
 }
 
+// ---------- 3. Admin notice: new feedback (to you) ----------
 async function sendFeedbackNotification(feedback) {
-    if (!emailTransport) return null;
-
-    const SMTP_EMAIL = process.env.SMTP_EMAIL || 'no-reply@scrabl.ai';
-    const adminEmail = process.env.WAITLIST_NOTIFICATION_EMAIL || SMTP_EMAIL;
+    if (!ADMIN_EMAIL) return null;
     const r = Number(feedback.rating) || 0;
-    const stars = r ? '\u2605'.repeat(r) + '\u2606'.repeat(5 - r) : 'No rating';
-
-    const message = {
-        from: `"scrabl." <${SMTP_EMAIL}>`,
-        to: adminEmail,
+    const stars = r ? '★'.repeat(r) + '☆'.repeat(5 - r) : 'No rating';
+    return sendViaResend({
+        to: ADMIN_EMAIL,
         subject: `New Scrabl feedback (${feedback.category}) from ${feedback.email}`,
         text: `New feedback:\nName: ${feedback.name || 'N/A'}\nEmail: ${feedback.email}\nCategory: ${feedback.category}\nRating: ${stars}\nMessage: ${feedback.message}\nSent: ${feedback.createdAt}`,
-        html: `<p><strong>New feedback received:</strong></p>
-<ul>
-    <li><strong>Name:</strong> ${feedback.name || 'N/A'}</li>
-    <li><strong>Email:</strong> ${feedback.email}</li>
-    <li><strong>Category:</strong> ${feedback.category}</li>
-    <li><strong>Rating:</strong> ${stars}</li>
-    <li><strong>Message:</strong> ${feedback.message}</li>
-    <li><strong>Sent:</strong> ${feedback.createdAt}</li>
-</ul>`
-    };
-
-    console.log(`\ud83d\udce8 Sending feedback notification to ${adminEmail}`);
-    const info = await emailTransport.sendMail(message);
-    console.log(`\u2705 Feedback notification sent: ${info.messageId || 'sent'}`);
-    return info;
+        html: `<div style="font-family: Arial, sans-serif; max-width: 520px; margin: 0 auto; background: #0a0a0a; color: #f5f5f5; border-radius: 14px; padding: 32px; border: 1px solid #1a1a1a;">
+    <h2 style="color: #D4AF37; margin: 0 0 20px;">New Feedback Received</h2>
+    <p style="margin: 8px 0;"><strong style="color:#888;">Name:</strong> ${feedback.name || 'N/A'}</p>
+    <p style="margin: 8px 0;"><strong style="color:#888;">Email:</strong> ${feedback.email}</p>
+    <p style="margin: 8px 0;"><strong style="color:#888;">Category:</strong> ${feedback.category}</p>
+    <p style="margin: 8px 0;"><strong style="color:#888;">Rating:</strong> <span style="color:#D4AF37;">${stars}</span></p>
+    <p style="margin: 16px 0 8px;"><strong style="color:#888;">Message:</strong></p>
+    <p style="background:#111; border-left: 3px solid #D4AF37; padding: 14px 16px; border-radius: 8px; line-height: 1.6; margin: 0;">${feedback.message}</p>
+    <p style="color:#555; font-size: 12px; margin-top: 20px;">Sent: ${feedback.createdAt}</p>
+</div>`
+    });
 }
 
 module.exports = { sendWaitlistEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport };
