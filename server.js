@@ -9,7 +9,7 @@ const nodemailer = require('nodemailer');
 const mongoose = require('mongoose');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
-const { sendWaitlistEmail, sendAdminNotification, setEmailTransport } = require('./emailService');
+const { sendWaitlistEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport } = require('./emailService');
 
 const app = express();
 const PORT = process.env.PORT || 5500;
@@ -37,17 +37,7 @@ try {
 }
 
 // Middleware
-app.use(cors({
-  origin: [
-    'http://localhost:5500',
-    'http://localhost:5000',
-    'http://127.0.0.1:5500',
-    'https://scrabl.com',
-    'https://www.scrabl.com',
-    'https://ahceed.github.io'
-  ],
-  credentials: true
-}));
+app.use(cors());
 app.use(express.json());
 
 // ========== IN-MEMORY STORAGE (auth - kept for now) ==========
@@ -85,6 +75,17 @@ const waitlistSchema = new mongoose.Schema({
 });
 const WaitlistEntry = mongoose.model('WaitlistEntry', waitlistSchema);
 
+// Feedback Schema + Model
+const feedbackSchema = new mongoose.Schema({
+    name:      { type: String, default: '' },
+    email:     { type: String, required: true, lowercase: true, trim: true },
+    category:  { type: String, default: 'other' },
+    rating:    { type: Number, default: 0 },
+    message:   { type: String, required: true },
+    createdAt: { type: Date, default: Date.now }
+});
+const Feedback = mongoose.model('Feedback', feedbackSchema);
+
 // ========== EMAIL TRANSPORT (Gmail SMTP) ==========
 let emailTransport = null;
 let emailTransportReady = false;
@@ -94,9 +95,7 @@ const SMTP_PASSWORD = process.env.SMTP_PASSWORD;
 
 if (SMTP_EMAIL && SMTP_PASSWORD) {
     emailTransport = nodemailer.createTransport({
-        host: 'smtp.gmail.com',
-        port: 587,
-        secure: false,
+        service: 'gmail',
         auth: { user: SMTP_EMAIL, pass: SMTP_PASSWORD }
     });
 } else {
@@ -524,6 +523,56 @@ app.post('/api/waitlist', async (req, res) => {
     }
 });
 
+// ========== FEEDBACK ENDPOINT ==========
+app.post('/api/feedback', async (req, res) => {
+    const name = (req.body?.name || '').trim();
+    const email = (req.body?.email || '').trim().toLowerCase();
+    const category = (req.body?.category || 'other').trim();
+    const rating = Number(req.body?.rating) || 0;
+    const message = (req.body?.message || '').trim();
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!message) {
+        return res.status(400).json({ error: 'Please enter a message.' });
+    }
+
+    try {
+        // 1. SAVE to MongoDB
+        await Feedback.create({ name, email, category, rating, message });
+        console.log(`\ud83d\udcac New feedback from ${email} | ${category} | ${rating} star`);
+
+        // 2. EMAIL you (don't block the response if email fails)
+        try {
+            await sendFeedbackNotification({ name, email, category, rating, message, createdAt: new Date().toISOString() });
+        } catch (emailErr) {
+            console.warn('\u26a0\ufe0f Feedback email failed but feedback saved:', emailErr?.message);
+        }
+
+        return res.status(200).json({ success: true, message: 'Feedback received!' });
+    } catch (err) {
+        console.error('Feedback error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
+// ========== FEEDBACK ADMIN: read all feedback (password protected) ==========
+app.get('/api/feedback/all', async (req, res) => {
+    const key = req.query.key || req.headers['x-admin-key'];
+    const ADMIN_KEY = process.env.FEEDBACK_ADMIN_KEY || 'change-me-now';
+    if (key !== ADMIN_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    try {
+        const all = await Feedback.find().sort({ createdAt: -1 }).limit(500).lean();
+        return res.status(200).json({ count: all.length, feedback: all });
+    } catch (err) {
+        console.error('Feedback fetch error:', err);
+        return res.status(500).json({ error: 'Could not load feedback.' });
+    }
+});
+
 // ========== WAITLIST CODE VERIFICATION ==========
 app.post('/api/waitlist/verify', async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
@@ -567,19 +616,7 @@ app.get('/api/health', (req, res) => {
 });
 
 async function startServer() {
-    const server = app.listen(PORT, () => {
-        console.log(`\n🚀 Scrabl Backend running on http://localhost:${PORT}`);
-        console.log(`📝 OTP codes logged to console in dev mode\n`);
-    });
-
-    server.on('error', (err) => {
-        if (err.code === 'EADDRINUSE') {
-            console.error(`\n⚠️  Port ${PORT} is already in use.`);
-            process.exit(1);
-        }
-        throw err;
-    });
-
+    // Verify SMTP if configured
     if (emailTransport) {
         setEmailTransport(emailTransport);
         try {
@@ -588,9 +625,22 @@ async function startServer() {
             console.log('✅ Gmail SMTP verified and ready');
         } catch (err) {
             console.warn('⚠️ SMTP verification failed:', err.message);
-            console.warn('   Waitlist emails will still be attempted on send');
-            emailTransportReady = true;
+            console.warn('   Waitlist codes will be logged to console instead');
         }
     }
+
+    const server = app.listen(PORT, () => {
+        console.log(`\n🚀 Scrabl Backend running on http://localhost:${PORT}`);
+        console.log(`📝 OTP codes logged to console in dev mode\n`);
+    });
+
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.error(`\n⚠️  Port ${PORT} is already in use. Stop the other process or set a different PORT in .env.`);
+            process.exit(1);
+        }
+        throw err;
+    });
 }
+
 startServer();
