@@ -9,6 +9,8 @@ const nodemailer = require('nodemailer');
 const mongoose = require('mongoose');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
+const { promisify } = require('util');
+const scryptAsync = promisify(crypto.scrypt);
 const { sendWaitlistEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport } = require('./emailService');
 
 const app = express();
@@ -40,17 +42,25 @@ try {
 app.use(cors());
 app.use(express.json());
 
-// ========== IN-MEMORY STORAGE (auth - kept for now) ==========
-const users = new Map();
-const otpStore = new Map();
-
-// Helper: Generate 6-digit OTP
-function generateOTP() {
-    return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
+// ========== HELPERS ==========
 function generateWaitlistCode() {
     return `SCRABL-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+}
+
+// Hash a password with scrypt (built into Node, no extra packages)
+async function hashPassword(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const derived = await scryptAsync(password, salt, 64);
+    return `${salt}:${derived.toString('hex')}`;
+}
+
+// Verify a password against a stored salt:hash (used later at login)
+async function verifyPassword(password, stored) {
+    if (!stored || !stored.includes(':')) return false;
+    const [salt, key] = stored.split(':');
+    const derived = await scryptAsync(password, salt, 64);
+    const keyBuf = Buffer.from(key, 'hex');
+    return keyBuf.length === derived.length && crypto.timingSafeEqual(keyBuf, derived);
 }
 
 // ========== MONGODB CONNECTION ==========
@@ -85,6 +95,15 @@ const feedbackSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 const Feedback = mongoose.model('Feedback', feedbackSchema);
+
+// User Schema + Model (auth)
+const userSchema = new mongoose.Schema({
+    name:         { type: String, default: '' },
+    email:        { type: String, required: true, unique: true, lowercase: true, trim: true },
+    passwordHash: { type: String, required: true },
+    createdAt:    { type: Date, default: Date.now }
+});
+const User = mongoose.model('User', userSchema);
 
 // ========== EMAIL TRANSPORT (Gmail SMTP) ==========
 let emailTransport = null;
@@ -257,167 +276,6 @@ function parseGeminiResponse(raw) {
         return parsed;
     }
 }
-
-// ========== SIGNUP ENDPOINT ==========
-app.post('/api/auth/signup', async (req, res) => {
-    const { name, email, password } = req.body;
-
-    // Validation
-    if (!name || !email || !password) {
-        return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    if (password.length < 8) {
-        return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    }
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        return res.status(400).json({ error: 'Invalid email format' });
-    }
-
-    // Check if user already exists
-    if (users.has(email)) {
-        return res.status(409).json({ error: 'Email already registered' });
-    }
-
-    // Generate OTP and store temporarily
-    const otp = generateOTP();
-    otpStore.set(email, { otp, createdAt: Date.now(), name, password });
-
-    // Send OTP via email
-    sendEmailWithOTP(email, otp);
-
-    return res.status(200).json({ 
-        message: 'OTP sent to email',
-        email: email
-    });
-});
-
-// ========== VERIFY OTP ENDPOINT ==========
-app.post('/api/auth/verify', async (req, res) => {
-    const { email, otp } = req.body;
-
-    // Validation
-    if (!email || !otp) {
-        return res.status(400).json({ error: 'Email and OTP required' });
-    }
-
-    // Check if OTP exists
-    if (!otpStore.has(email)) {
-        return res.status(400).json({ error: 'No verification code found. Please sign up again.' });
-    }
-
-    const storedData = otpStore.get(email);
-    const { otp: storedOTP, createdAt, name, password } = storedData;
-
-    // Check if OTP is expired (10 minutes)
-    if (Date.now() - createdAt > 10 * 60 * 1000) {
-        otpStore.delete(email);
-        return res.status(400).json({ error: 'OTP expired. Please request a new code.' });
-    }
-
-    // Verify OTP
-    if (otp !== storedOTP) {
-        return res.status(400).json({ error: 'Invalid OTP code' });
-    }
-
-    // OTP correct - create user account
-    users.set(email, { name, email, password, createdAt: new Date(), preferences: storedData.preferences || {} });
-    otpStore.delete(email); // Remove used OTP
-
-    return res.status(200).json({ 
-        message: 'Account created successfully',
-        user: { name, email, createdAt: new Date() }
-    });
-});
-
-// ========== RESEND OTP ENDPOINT ==========
-app.post('/api/auth/resend', async (req, res) => {
-    const { email } = req.body;
-
-    if (!email) {
-        return res.status(400).json({ error: 'Email required' });
-    }
-
-    if (!otpStore.has(email)) {
-        return res.status(400).json({ error: 'No pending verification for this email' });
-    }
-
-    // Generate new OTP
-    const otp = generateOTP();
-    const storedData = otpStore.get(email);
-    otpStore.set(email, { ...storedData, otp, createdAt: Date.now() });
-
-    // Send new OTP
-    sendEmailWithOTP(email, otp);
-
-    return res.status(200).json({ message: 'New OTP sent to email' });
-});
-
-// ========== LOGIN ENDPOINT ==========
-app.post('/api/auth/login', async (req, res) => {
-    const { email, password } = req.body;
-
-    // Validation
-    if (!email || !password) {
-        return res.status(400).json({ error: 'Email and password required' });
-    }
-
-    // Check if user exists
-    if (!users.has(email)) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-    }
-
-    const user = users.get(email);
-    
-    // Check password (in production, use proper password hashing)
-    if (user.password !== password) {
-        return res.status(401).json({ error: 'Invalid email or password' });
-    }
-
-    return res.status(200).json({ 
-        message: 'Login successful',
-        user: { name: user.name, email: user.email, createdAt: user.createdAt }
-    });
-});
-
-// ========== GET USER PREFERENCES ==========
-app.get('/api/user/preferences', (req, res) => {
-    const { email } = req.query;
-
-    if (!email) {
-        return res.status(400).json({ error: 'Email required' });
-    }
-
-    if (!users.has(email)) {
-        return res.status(404).json({ error: 'User not found' });
-    }
-
-    const user = users.get(email);
-    return res.status(200).json({ preferences: user.preferences || {} });
-});
-
-// ========== UPDATE USER PREFERENCES ==========
-app.post('/api/user/preferences', (req, res) => {
-    const { email, preferences } = req.body;
-
-    if (!email || !preferences) {
-        return res.status(400).json({ error: 'Email and preferences required' });
-    }
-
-    if (!users.has(email)) {
-        return res.status(404).json({ error: 'User not found' });
-    }
-
-    const user = users.get(email);
-    user.preferences = preferences;
-    users.set(email, user);
-
-    return res.status(200).json({ 
-        message: 'Preferences updated successfully',
-        preferences: user.preferences
-    });
-});
 
 // ========== GEMINI PROXY ENDPOINT ==========
 app.post('/api/gemini/generate', async (req, res) => {
@@ -607,6 +465,46 @@ app.post('/api/waitlist/verify', async (req, res) => {
     } catch (err) {
         console.error('Waitlist verify error:', err);
         return res.status(500).json({ error: 'Verification failed. Please try again.' });
+    }
+});
+
+// ========== AUTH: SIGNUP ==========
+app.post('/api/auth/signup', async (req, res) => {
+    try {
+        const name = (req.body?.name || '').trim();
+        const email = (req.body?.email || '').trim().toLowerCase();
+        const password = req.body?.password || '';
+
+        // Validate
+        if (!name) return res.status(400).json({ error: 'Please enter your name.' });
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            return res.status(400).json({ error: 'Please enter a valid email address.' });
+        }
+        if (password.length < 8) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        }
+
+        // Already registered?
+        const existing = await User.findOne({ email });
+        if (existing) {
+            return res.status(409).json({ error: 'An account with this email already exists.' });
+        }
+
+        // Hash + save
+        const passwordHash = await hashPassword(password);
+        const user = await User.create({ name, email, passwordHash });
+        console.log(`\ud83d\udc64 New account created: ${email}`);
+
+        return res.status(201).json({
+            success: true,
+            user: { id: user._id, name: user.name, email: user.email }
+        });
+    } catch (err) {
+        if (err && err.code === 11000) {
+            return res.status(409).json({ error: 'An account with this email already exists.' });
+        }
+        console.error('Signup error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
     }
 });
 
