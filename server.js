@@ -63,6 +63,27 @@ async function verifyPassword(password, stored) {
     return keyBuf.length === derived.length && crypto.timingSafeEqual(keyBuf, derived);
 }
 
+// ----- Session tokens (signed with crypto, no JWT library needed) -----
+const AUTH_SECRET = process.env.AUTH_SECRET || 'scrabl-dev-secret-change-me';
+
+function signToken(payload) {
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', AUTH_SECRET).update(body).digest('base64url');
+    return `${body}.${sig}`;
+}
+
+function verifyToken(token) {
+    if (!token || !token.includes('.')) return null;
+    const [body, sig] = token.split('.');
+    const expected = crypto.createHmac('sha256', AUTH_SECRET).update(body).digest('base64url');
+    if (sig !== expected) return null;
+    try {
+        const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+        if (payload.exp && Date.now() > payload.exp) return null;
+        return payload;
+    } catch (e) { return null; }
+}
+
 // ========== MONGODB CONNECTION ==========
 const MONGO_URI = process.env.MONGO_URI;
 if (MONGO_URI) {
@@ -504,6 +525,41 @@ app.post('/api/auth/signup', async (req, res) => {
             return res.status(409).json({ error: 'An account with this email already exists.' });
         }
         console.error('Signup error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
+// ========== AUTH: LOGIN ==========
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const email = (req.body?.email || '').trim().toLowerCase();
+        const password = req.body?.password || '';
+
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Enter your email and password.' });
+        }
+
+        const user = await User.findOne({ email });
+        // Same message whether email is unknown or password is wrong (don't leak which emails exist)
+        if (!user) return res.status(401).json({ error: 'Incorrect email or password.' });
+
+        const valid = await verifyPassword(password, user.passwordHash);
+        if (!valid) return res.status(401).json({ error: 'Incorrect email or password.' });
+
+        const token = signToken({
+            id: user._id.toString(),
+            email: user.email,
+            exp: Date.now() + 7 * 24 * 60 * 60 * 1000  // 7 days
+        });
+        console.log(`\ud83d\udd11 Login: ${email}`);
+
+        return res.status(200).json({
+            success: true,
+            token,
+            user: { id: user._id, name: user.name, email: user.email }
+        });
+    } catch (err) {
+        console.error('Login error:', err);
         return res.status(500).json({ error: 'Something went wrong. Please try again.' });
     }
 });
