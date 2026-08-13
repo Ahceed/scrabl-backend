@@ -122,6 +122,8 @@ const userSchema = new mongoose.Schema({
     name:         { type: String, default: '' },
     email:        { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
+    onboarded:    { type: Boolean, default: false },
+    profile:      { type: Object, default: {} },
     createdAt:    { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
@@ -556,11 +558,56 @@ app.post('/api/auth/login', async (req, res) => {
         return res.status(200).json({
             success: true,
             token,
+            onboarded: user.onboarded,
             user: { id: user._id, name: user.name, email: user.email }
         });
     } catch (err) {
         console.error('Login error:', err);
         return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
+// ========== AUTH: CURRENT USER (verifies token) ==========
+app.get('/api/auth/me', async (req, res) => {
+    try {
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.query.token || '');
+        const payload = verifyToken(token);
+        if (!payload) return res.status(401).json({ error: 'Not authenticated.' });
+
+        const user = await User.findById(payload.id).lean();
+        if (!user) return res.status(401).json({ error: 'Account not found.' });
+
+        return res.status(200).json({ onboarded: user.onboarded, user: { id: user._id, name: user.name, email: user.email } });
+    } catch (err) {
+        console.error('Auth check error:', err);
+        return res.status(500).json({ error: 'Something went wrong.' });
+    }
+});
+
+// ========== ONBOARDING: save profile + mark onboarded ==========
+app.post('/api/onboarding', async (req, res) => {
+    try {
+        // Identify the user from their login token
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
+        const payload = verifyToken(token);
+        if (!payload) return res.status(401).json({ error: 'Please log in again.' });
+
+        const profile = req.body?.profile || {};
+
+        const user = await User.findByIdAndUpdate(
+            payload.id,
+            { $set: { profile: profile, onboarded: true } },
+            { new: true }
+        );
+        if (!user) return res.status(404).json({ error: 'Account not found.' });
+        console.log(`\ud83c\udf1f Onboarding completed: ${user.email}`);
+
+        return res.status(200).json({ success: true, onboarded: true });
+    } catch (err) {
+        console.error('Onboarding error:', err);
+        return res.status(500).json({ error: 'Could not save your setup. Please try again.' });
     }
 });
 
