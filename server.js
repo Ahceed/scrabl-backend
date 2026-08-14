@@ -11,7 +11,7 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 const { promisify } = require('util');
 const scryptAsync = promisify(crypto.scrypt);
-const { sendWaitlistEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport } = require('./emailService');
+const { sendWaitlistEmail, sendVerificationEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport } = require('./emailService');
 
 const app = express();
 const PORT = process.env.PORT || 5500;
@@ -84,6 +84,11 @@ function verifyToken(token) {
     } catch (e) { return null; }
 }
 
+// 6-digit email verification code
+function generateVerifyCode() {
+    return String(Math.floor(100000 + Math.random() * 900000));
+}
+
 // ========== MONGODB CONNECTION ==========
 const MONGO_URI = process.env.MONGO_URI;
 if (MONGO_URI) {
@@ -122,6 +127,9 @@ const userSchema = new mongoose.Schema({
     name:         { type: String, default: '' },
     email:        { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
+    verified:     { type: Boolean, default: false },
+    verifyCode:        { type: String, default: '' },
+    verifyCodeExpires: { type: Date },
     onboarded:    { type: Boolean, default: false },
     profile:      { type: Object, default: {} },
     createdAt:    { type: Date, default: Date.now }
@@ -513,13 +521,33 @@ app.post('/api/auth/signup', async (req, res) => {
             return res.status(409).json({ error: 'An account with this email already exists.' });
         }
 
-        // Hash + save
+        // Hash + create account (unverified) with a fresh 6-digit code
         const passwordHash = await hashPassword(password);
-        const user = await User.create({ name, email, passwordHash });
-        console.log(`\ud83d\udc64 New account created: ${email}`);
+        const code = generateVerifyCode();
+        const user = await User.create({
+            name, email, passwordHash,
+            verified: false,
+            verifyCode: code,
+            verifyCodeExpires: new Date(Date.now() + 15 * 60 * 1000)  // 15 min
+        });
+        console.log(`\ud83d\udc64 New account created (unverified): ${email}`);
+
+        // Email the code (don't fail signup if email hiccups)
+        try { await sendVerificationEmail(email, code, name); }
+        catch (e) { console.warn('\u26a0\ufe0f Verification email failed to send:', e.message); }
+
+        // Auto-login: issue a token so they flow straight into verify -> onboarding
+        const token = signToken({
+            id: user._id.toString(),
+            email: user.email,
+            exp: Date.now() + 7 * 24 * 60 * 60 * 1000
+        });
 
         return res.status(201).json({
             success: true,
+            token,
+            verified: false,
+            onboarded: false,
             user: { id: user._id, name: user.name, email: user.email }
         });
     } catch (err) {
@@ -558,11 +586,75 @@ app.post('/api/auth/login', async (req, res) => {
         return res.status(200).json({
             success: true,
             token,
+            verified: user.verified,
             onboarded: user.onboarded,
             user: { id: user._id, name: user.name, email: user.email }
         });
     } catch (err) {
         console.error('Login error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
+// ========== AUTH: VERIFY EMAIL ==========
+app.post('/api/auth/verify-email', async (req, res) => {
+    try {
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
+        const payload = verifyToken(token);
+        if (!payload) return res.status(401).json({ error: 'Please sign up or log in again.' });
+
+        const code = (req.body?.code || '').trim();
+        if (!code) return res.status(400).json({ error: 'Enter the 6-digit code.' });
+
+        const user = await User.findById(payload.id);
+        if (!user) return res.status(404).json({ error: 'Account not found.' });
+        if (user.verified) return res.status(200).json({ success: true, alreadyVerified: true, onboarded: user.onboarded });
+
+        if (!user.verifyCode || user.verifyCode !== code) {
+            return res.status(400).json({ error: 'That code is incorrect.' });
+        }
+        if (!user.verifyCodeExpires || Date.now() > new Date(user.verifyCodeExpires).getTime()) {
+            return res.status(400).json({ error: 'That code has expired. Request a new one.' });
+        }
+
+        user.verified = true;
+        user.verifyCode = '';
+        user.verifyCodeExpires = undefined;
+        await user.save();
+        console.log(`\u2705 Email verified: ${user.email}`);
+
+        return res.status(200).json({ success: true, verified: true, onboarded: user.onboarded });
+    } catch (err) {
+        console.error('Verify email error:', err);
+        return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    }
+});
+
+// ========== AUTH: RESEND VERIFICATION CODE ==========
+app.post('/api/auth/resend-code', async (req, res) => {
+    try {
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
+        const payload = verifyToken(token);
+        if (!payload) return res.status(401).json({ error: 'Please sign up or log in again.' });
+
+        const user = await User.findById(payload.id);
+        if (!user) return res.status(404).json({ error: 'Account not found.' });
+        if (user.verified) return res.status(200).json({ success: true, alreadyVerified: true });
+
+        const code = generateVerifyCode();
+        user.verifyCode = code;
+        user.verifyCodeExpires = new Date(Date.now() + 15 * 60 * 1000);
+        await user.save();
+
+        try { await sendVerificationEmail(user.email, code, user.name); }
+        catch (e) { console.warn('\u26a0\ufe0f Resend verification email failed:', e.message); }
+        console.log(`\ud83d\udd01 Resent verification code: ${user.email}`);
+
+        return res.status(200).json({ success: true });
+    } catch (err) {
+        console.error('Resend code error:', err);
         return res.status(500).json({ error: 'Something went wrong. Please try again.' });
     }
 });
@@ -578,7 +670,7 @@ app.get('/api/auth/me', async (req, res) => {
         const user = await User.findById(payload.id).lean();
         if (!user) return res.status(401).json({ error: 'Account not found.' });
 
-        return res.status(200).json({ onboarded: user.onboarded, user: { id: user._id, name: user.name, email: user.email } });
+        return res.status(200).json({ verified: user.verified, onboarded: user.onboarded, user: { id: user._id, name: user.name, email: user.email } });
     } catch (err) {
         console.error('Auth check error:', err);
         return res.status(500).json({ error: 'Something went wrong.' });
