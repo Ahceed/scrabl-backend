@@ -131,4 +131,33 @@ async function sendFeedbackNotification(feedback) {
     });
 }
 
-module.exports = { sendWaitlistEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport };
+async function sendVerificationEmail(email, code, name = 'Creator') {
+    const displayName = name || 'Creator';
+    const htmlBody = `
+<div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 520px; margin: 0 auto; background: #0a0a0a; color: #f5f5f5; border-radius: 16px; overflow: hidden; border: 1px solid #1a1a1a;">
+    <div style="padding: 40px 30px 20px; text-align: center;">
+        <h1 style="color: #D4AF37; font-size: 32px; margin: 0 0 6px; font-weight: 800;">scrabl.</h1>
+        <p style="color: #666; font-size: 12px; letter-spacing: 4px; text-transform: uppercase; margin: 0;">Craft Influence</p>
+    </div>
+    <div style="padding: 10px 30px 40px; text-align: center;">
+        <p style="font-size: 16px; color: #ccc; margin-bottom: 28px;">Hi <strong>${displayName}</strong>, welcome to Scrabl. Confirm your email to continue.</p>
+        <p style="font-size: 13px; color: #888; margin-bottom: 12px; letter-spacing: 2px; text-transform: uppercase;">Your Verification Code</p>
+        <div style="background: #111; border: 2px solid #D4AF37; border-radius: 14px; padding: 24px; margin-bottom: 28px;">
+            <span style="font-size: 40px; font-weight: bold; letter-spacing: 8px; color: #D4AF37; font-family: monospace;">${code}</span>
+        </div>
+        <p style="font-size: 14px; color: #888; margin-bottom: 20px;">Enter this code to verify your account. It expires in 15 minutes.</p>
+        <p style="font-size: 13px; color: #666;">If you didn't create a Scrabl account, you can ignore this email.</p>
+        <div style="margin-top: 30px;">
+            <p style="color: #D4AF37; font-size: 13px; font-weight: 600; letter-spacing: 2px;">#scrabl26</p>
+        </div>
+    </div>
+</div>`;
+    return sendViaResend({
+        to: email,
+        subject: `${code} is your Scrabl verification code`,
+        text: `Hi ${displayName}, your Scrabl verification code is ${code}. It expires in 15 minutes.`,
+        html: htmlBody
+    });
+}
+
+module.exports = { sendWaitlistEmail, sendVerificationEmail, sendAdminNotification, sendFeedbackNotification, setEmailTransport };
