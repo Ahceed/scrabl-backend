@@ -132,6 +132,8 @@ const userSchema = new mongoose.Schema({
     verifyCodeExpires: { type: Date },
     onboarded:    { type: Boolean, default: false },
     profile:      { type: Object, default: {} },
+    voiceDNA:     { type: Object, default: null },
+    voiceDNAUpdatedAt: { type: Date },
     createdAt:    { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
@@ -700,6 +702,95 @@ app.post('/api/onboarding', async (req, res) => {
     } catch (err) {
         console.error('Onboarding error:', err);
         return res.status(500).json({ error: 'Could not save your setup. Please try again.' });
+    }
+});
+
+// ========== VOICE DNA: analyze samples into a stored voice profile ==========
+
+// Build the analysis prompt from a creator's samples + light context
+function buildVoiceAnalysisPrompt(samples, context) {
+    const ctx = context || {};
+    const niche = Array.isArray(ctx.niche) ? ctx.niche.join(', ') : (ctx.niche || 'unspecified');
+    const platforms = ctx.platforms ? Object.keys(ctx.platforms).join(', ') : 'unspecified';
+    const numbered = (samples || []).map((s, i) => `SAMPLE ${i + 1}:\n${s}`).join('\n\n');
+
+    return [
+        'You are an expert linguistic analyst for African (especially Nigerian) content creators.',
+        'Below are real sample posts written by ONE creator. Study HOW they write — not what they write about.',
+        `Their niche: ${niche}. They post on: ${platforms}.`,
+        '',
+        'Return ONLY a valid JSON object (no markdown, no backticks, no commentary) with EXACTLY these keys:',
+        '{',
+        '  "voiceSummary": "2-3 sentences in plain English describing how this person writes, as if briefing a ghostwriter",',
+        '  "tone": ["up to 4 adjectives"],',
+        '  "formality": "very informal | informal | neutral | formal",',
+        '  "sentenceStyle": "short description of sentence length and rhythm",',
+        '  "capitalization": "how they use capitals (e.g. lowercase-heavy, standard)",',
+        '  "emojiUsage": "how often and which emojis, or none",',
+        '  "signaturePhrases": ["words/phrases/slang they actually use"],',
+        '  "slangLevel": "none | light | moderate | heavy (note if Nigerian/Pidgin)",',
+        '  "do": ["3-5 concrete instructions to sound like them"],',
+        '  "dont": ["3-5 things to avoid so it does not sound generic/AI"]',
+        '}',
+        '',
+        'Base every field ONLY on evidence in the samples. If samples are too thin for a field, make your best reasonable inference.',
+        '',
+        'THE CREATORS SAMPLES:',
+        numbered
+    ].join('\n');
+}
+
+// Pull a JSON object out of Gemini's raw text (handles ```json fences etc.)
+function parseVoiceJSON(raw) {
+    if (!raw) return null;
+    let text = String(raw).trim();
+    text = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1 || end <= start) return null;
+    try { return JSON.parse(text.slice(start, end + 1)); }
+    catch (e) { return null; }
+}
+
+app.post('/api/voice/analyze', async (req, res) => {
+    try {
+        // Identify the user from their login token
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
+        const payload = verifyToken(token);
+        if (!payload) return res.status(401).json({ error: 'Please log in again.' });
+
+        if (!geminiClient) {
+            return res.status(503).json({ error: geminiInitError || 'Gemini not initialized.' });
+        }
+
+        const user = await User.findById(payload.id);
+        if (!user) return res.status(404).json({ error: 'Account not found.' });
+
+        const profile = user.profile || {};
+        const samples = Array.isArray(profile.voiceSamples) ? profile.voiceSamples.filter(Boolean) : [];
+        if (samples.length < 2) {
+            return res.status(400).json({ error: 'Not enough voice samples to analyze. Add a few posts in onboarding first.' });
+        }
+
+        const prompt = buildVoiceAnalysisPrompt(samples, profile);
+        const result = await geminiClient.generateContent(prompt);
+        const rawText = await extractGeminiRawText(result);
+        const voiceDNA = parseVoiceJSON(rawText);
+
+        if (!voiceDNA || !voiceDNA.voiceSummary) {
+            return res.status(502).json({ error: 'Could not parse a voice profile from the model.', rawText });
+        }
+
+        user.voiceDNA = voiceDNA;
+        user.voiceDNAUpdatedAt = new Date();
+        await user.save();
+        console.log(`\ud83e\uddec Voice DNA analyzed for: ${user.email}`);
+
+        return res.status(200).json({ success: true, voiceDNA });
+    } catch (err) {
+        console.error('Voice analyze error:', err);
+        return res.status(500).json({ error: 'Voice analysis failed. Please try again.' });
     }
 });
 
