@@ -679,10 +679,9 @@ app.get('/api/auth/me', async (req, res) => {
     }
 });
 
-// ========== ONBOARDING: save profile + mark onboarded ==========
+// ========== ONBOARDING: save profile + analyze voice + mark onboarded ==========
 app.post('/api/onboarding', async (req, res) => {
     try {
-        // Identify the user from their login token
         const auth = req.headers.authorization || '';
         const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
         const payload = verifyToken(token);
@@ -690,15 +689,32 @@ app.post('/api/onboarding', async (req, res) => {
 
         const profile = req.body?.profile || {};
 
-        const user = await User.findByIdAndUpdate(
-            payload.id,
-            { $set: { profile: profile, onboarded: true } },
-            { new: true }
-        );
+        const user = await User.findById(payload.id);
         if (!user) return res.status(404).json({ error: 'Account not found.' });
-        console.log(`\ud83c\udf1f Onboarding completed: ${user.email}`);
 
-        return res.status(200).json({ success: true, onboarded: true });
+        // Save the profile first, so their samples are stored even if analysis needs a retry
+        user.profile = profile;
+        await user.save();
+
+        // Analyze their voice — onboarding only completes if this succeeds
+        let voiceDNA;
+        try {
+            voiceDNA = await analyzeVoiceDNA(profile);
+        } catch (analysisErr) {
+            console.warn('\u26a0\ufe0f Onboarding voice analysis failed:', analysisErr.message);
+            const msg = analysisErr.message === 'NOT_ENOUGH_SAMPLES'
+                ? 'Please add at least a couple of writing samples so we can learn your voice.'
+                : 'We could not set up your voice just now. Please try again.';
+            return res.status(502).json({ error: msg, onboarded: false });
+        }
+
+        user.voiceDNA = voiceDNA;
+        user.voiceDNAUpdatedAt = new Date();
+        user.onboarded = true;
+        await user.save();
+        console.log(`\ud83c\udf1f Onboarding + Voice DNA completed: ${user.email}`);
+
+        return res.status(200).json({ success: true, onboarded: true, voiceDNA });
     } catch (err) {
         console.error('Onboarding error:', err);
         return res.status(500).json({ error: 'Could not save your setup. Please try again.' });
@@ -752,41 +768,47 @@ function parseVoiceJSON(raw) {
     catch (e) { return null; }
 }
 
+// Shared: analyze a profile's samples into a voiceDNA object (throws on failure)
+async function analyzeVoiceDNA(profile) {
+    if (!geminiClient) throw new Error(geminiInitError || 'Gemini not initialized.');
+    const samples = Array.isArray(profile?.voiceSamples) ? profile.voiceSamples.filter(Boolean) : [];
+    if (samples.length < 2) throw new Error('NOT_ENOUGH_SAMPLES');
+    const prompt = buildVoiceAnalysisPrompt(samples, profile);
+    const result = await geminiClient.generateContent(prompt);
+    const rawText = await extractGeminiRawText(result);
+    const voiceDNA = parseVoiceJSON(rawText);
+    if (!voiceDNA || !voiceDNA.voiceSummary) {
+        const e = new Error('PARSE_FAILED');
+        e.rawText = rawText;
+        throw e;
+    }
+    return voiceDNA;
+}
+
+// Standalone route: (re)analyze the logged-in user's voice on demand
 app.post('/api/voice/analyze', async (req, res) => {
     try {
-        // Identify the user from their login token
         const auth = req.headers.authorization || '';
         const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
         const payload = verifyToken(token);
         if (!payload) return res.status(401).json({ error: 'Please log in again.' });
 
-        if (!geminiClient) {
-            return res.status(503).json({ error: geminiInitError || 'Gemini not initialized.' });
-        }
-
         const user = await User.findById(payload.id);
         if (!user) return res.status(404).json({ error: 'Account not found.' });
 
-        const profile = user.profile || {};
-        const samples = Array.isArray(profile.voiceSamples) ? profile.voiceSamples.filter(Boolean) : [];
-        if (samples.length < 2) {
-            return res.status(400).json({ error: 'Not enough voice samples to analyze. Add a few posts in onboarding first.' });
-        }
-
-        const prompt = buildVoiceAnalysisPrompt(samples, profile);
-        const result = await geminiClient.generateContent(prompt);
-        const rawText = await extractGeminiRawText(result);
-        const voiceDNA = parseVoiceJSON(rawText);
-
-        if (!voiceDNA || !voiceDNA.voiceSummary) {
-            return res.status(502).json({ error: 'Could not parse a voice profile from the model.', rawText });
+        let voiceDNA;
+        try {
+            voiceDNA = await analyzeVoiceDNA(user.profile || {});
+        } catch (e) {
+            if (e.message === 'NOT_ENOUGH_SAMPLES') return res.status(400).json({ error: 'Not enough voice samples to analyze.' });
+            if (e.message === 'PARSE_FAILED') return res.status(502).json({ error: 'Could not read a voice profile from the model.' });
+            throw e;
         }
 
         user.voiceDNA = voiceDNA;
         user.voiceDNAUpdatedAt = new Date();
         await user.save();
         console.log(`\ud83e\uddec Voice DNA analyzed for: ${user.email}`);
-
         return res.status(200).json({ success: true, voiceDNA });
     } catch (err) {
         console.error('Voice analyze error:', err);
