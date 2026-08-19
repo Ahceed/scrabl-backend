@@ -354,19 +354,6 @@ app.post('/api/gemini/generate', async (req, res) => {
 
 // ========== SIMPLE LOCAL STUB GENERATE ENDPOINT ==========
 // This lightweight endpoint allows frontend testing without Gemini.
-app.post('/api/generate', (req, res) => {
-    const { userPrompt = '' } = req.body || {};
-    const sampleRaw = `[[HOOKS]]\n- Quick hook 1\n- Quick hook 2\n\n[[DESCRIPTION]]\nA short, high-retention caption generated for testing.\n\n[[STRATEGY]]\nUse short punchy lines and a CTA.\n\n[[HASHTAGS]]\n#test #scrabl`;
-    const sampleSections = {
-        hooks: ['Quick hook 1', 'Quick hook 2', 'Quick hook 3'],
-        description: ['A short, high-retention caption generated for testing.'],
-        strategy: ['Use short punchy lines and a CTA.'],
-        hashtags: ['#test', '#scrabl']
-    };
-    console.log('[/api/generate] stub invoked, prompt length:', (userPrompt || '').length);
-    return res.json({ rawText: sampleRaw, sections: sampleSections });
-});
-
 // ========== WAITLIST SIGNUP ENDPOINT ==========
 app.post('/api/waitlist', async (req, res) => {
     const email = (req.body?.email || '').trim().toLowerCase();
@@ -813,6 +800,105 @@ app.post('/api/voice/analyze', async (req, res) => {
     } catch (err) {
         console.error('Voice analyze error:', err);
         return res.status(500).json({ error: 'Voice analysis failed. Please try again.' });
+    }
+});
+
+// ========== GENERATION: full package (post + hook + hashtags) per platform ==========
+const PLATFORM_RULES = {
+    "X / Twitter": "Punchy and conversational. Lead with a strong hook. Keep the post under 280 characters. A natural, fragmented rhythm works well. Use 0-2 hashtags max, only if they fit naturally.",
+    "Instagram": "A storytelling caption with natural line breaks and real personality. Emotive and relatable. End with a question or CTA that drives comments. Provide 5-10 relevant hashtags.",
+    "TikTok": "A short, hook-forward caption written to sit under a video. Trend-aware and casual. Provide 3-5 hashtags mixing niche and broad discovery tags.",
+    "LinkedIn": "Professional but genuinely human. A real insight or short story, no corporate cringe, no buzzwords. Short paragraphs. Provide up to 3 hashtags.",
+    "YouTube": "The post should be a compelling video TITLE, then a short description on the following lines. Provide 3-5 hashtags.",
+    "Facebook": "Warm, conversational, community feel. Slightly longer is fine. Provide 0-3 hashtags.",
+    "Threads": "Casual and conversational, like a relaxed X post. Minimal or no hashtags."
+};
+
+function buildGenerationPrompt(input, platforms, user) {
+    const dna = user.voiceDNA || null;
+    const profile = user.profile || {};
+    const niche = Array.isArray(profile.niche) ? profile.niche.join(', ') : (profile.niche || 'general');
+
+    let voiceBlock;
+    if (dna) {
+        const parts = [];
+        parts.push(`- How they write: ${dna.voiceSummary || ''}`);
+        if (dna.tone) parts.push(`- Tone: ${Array.isArray(dna.tone) ? dna.tone.join(', ') : dna.tone}`);
+        if (dna.capitalization) parts.push(`- Capitalization: ${dna.capitalization}`);
+        if (dna.emojiUsage) parts.push(`- Emoji use: ${dna.emojiUsage}`);
+        if (dna.signaturePhrases && dna.signaturePhrases.length) parts.push(`- Signature phrases: ${dna.signaturePhrases.join(', ')}`);
+        if (dna.do && dna.do.length) parts.push(`- DO: ${dna.do.join('; ')}`);
+        if (dna.dont && dna.dont.length) parts.push(`- DO NOT: ${dna.dont.join('; ')}`);
+        voiceBlock = `Write in THIS creator's exact voice:\n${parts.join('\n')}`;
+    } else {
+        voiceBlock = `Write in a natural, human, casual voice suited to an African (Nigerian) creator. Avoid robotic or corporate phrasing.`;
+    }
+
+    const platformInstructions = platforms.map(function (p) {
+        const rule = PLATFORM_RULES[p] || 'Write a natural post optimized for this platform.';
+        return `PLATFORM "${p}": ${rule}`;
+    }).join('\n');
+
+    return `You are Scrabl, a content engine built for African (especially Nigerian) creators.
+You write like a REAL human, never like AI. You never use robotic, generic, or corporate "AI-slop" phrasing, and you never sound like a press release.
+
+${voiceBlock}
+
+The creator's niche: ${niche}.
+
+The creator will give you ONE raw idea. For EACH platform below, reimagine it natively for that platform (never copy-paste the same text) while keeping the creator's voice intact.
+${platformInstructions}
+
+THE CREATOR'S IDEA:
+${input}
+
+Return ONLY valid JSON (no markdown, no backticks, no commentary) in EXACTLY this shape:
+{
+  "platforms": {
+    "<platform name exactly as given>": {
+      "post": "the ready-to-post caption in their voice, optimized for this platform",
+      "hook": "a scroll-stopping first line or hook",
+      "hashtags": ["#relevant", "#tags"]
+    }
+  }
+}
+Include an entry for every platform requested. Keep everything in the creator's authentic voice.`;
+}
+
+app.post('/api/generate', async (req, res) => {
+    try {
+        const auth = req.headers.authorization || '';
+        const token = auth.startsWith('Bearer ') ? auth.slice(7) : (req.body?.token || '');
+        const payload = verifyToken(token);
+        if (!payload) return res.status(401).json({ error: 'Please log in again.' });
+
+        if (!geminiClient) return res.status(503).json({ error: geminiInitError || 'Gemini not initialized.' });
+
+        const input = (req.body?.input || '').trim();
+        let platforms = req.body?.platforms;
+        if (!input) return res.status(400).json({ error: 'Type an idea to generate from.' });
+        if (!Array.isArray(platforms) || platforms.length === 0) {
+            return res.status(400).json({ error: 'Pick at least one platform.' });
+        }
+        platforms = platforms.slice(0, 7);
+
+        const user = await User.findById(payload.id);
+        if (!user) return res.status(404).json({ error: 'Account not found.' });
+
+        const prompt = buildGenerationPrompt(input, platforms, user);
+        const result = await geminiClient.generateContent(prompt);
+        const rawText = await extractGeminiRawText(result);
+        const parsed = parseVoiceJSON(rawText);
+
+        if (!parsed || !parsed.platforms) {
+            return res.status(502).json({ error: 'Could not generate right now. Please try again.' });
+        }
+
+        console.log('Generated for ' + user.email + ' - platforms: ' + platforms.join(', '));
+        return res.status(200).json({ success: true, results: parsed.platforms });
+    } catch (err) {
+        console.error('Generate error:', err);
+        return res.status(500).json({ error: 'Generation failed. Please try again.' });
     }
 });
 
